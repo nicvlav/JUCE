@@ -1533,15 +1533,39 @@ public:
             audioBuffer.clearUnusedChannels ((int) nFrames);
         }
 
+       #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+        // hostProtocol is set when the host uses MIDIEventList,
+        // meaning UMP packets land in incomingUmpEvents rather than legacy
+        // HandleMIDIEvent/HandleSysEx filling incomingEvents.
+        const bool useUMP = hostProtocol.has_value()
+                            && juceFilter->supportsUMPProcessing();
+       #endif
+
         // swap midi buffers
         {
             const ScopedLock sl (incomingMidiLock);
-            midiEvents.clear();
-            incomingEvents.swapWith (midiEvents);
+
+           #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+            if (useUMP)
+            {
+                umpEvents.clear();
+                incomingUmpEvents.swapWith (umpEvents);
+            }
+            else
+           #endif
+            {
+                midiEvents.clear();
+                incomingEvents.swapWith (midiEvents);
+            }
         }
 
         // process audio
-        processBlock (audioBuffer.getBuffer (nFrames), midiEvents);
+       #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+        if (useUMP)
+            processBlock (audioBuffer.getBuffer (nFrames), umpEvents);
+        else
+       #endif
+            processBlock (audioBuffer.getBuffer (nFrames), midiEvents);
 
         // copy back
         {
@@ -1553,7 +1577,12 @@ public:
         if constexpr (pluginProducesMidiOutput)
             pushMidiOutput (nFrames);
 
-        midiEvents.clear();
+       #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+        if (useUMP)
+            umpEvents.clear();
+        else
+       #endif
+            midiEvents.clear();
 
         return noErr;
     }
@@ -1600,17 +1629,37 @@ public:
     {
         const ScopedLock sl (incomingMidiLock);
 
+        const bool useUMP = juceFilter != nullptr && juceFilter->supportsUMPProcessing();
         auto* packet = &list->packet[0];
 
         for (uint32_t i = 0; i < list->numPackets; ++i)
         {
-            toBytestreamDispatcher.dispatch ({ reinterpret_cast<const uint32_t*> (packet->words),
-                                               (size_t) packet->wordCount },
-                                             static_cast<double> (packet->timeStamp + inOffsetSampleFrame),
-                                             [this] (const ump::BytesOnGroup& x, double t)
-                                             {
-                                                 incomingEvents.addEvent ({ x.bytes.data(), (int) x.bytes.size(), t }, (int) t);
-                                             });
+            const auto samplePos = static_cast<int> (packet->timeStamp + inOffsetSampleFrame);
+
+            if (useUMP)
+            {
+                umpDispatcher.dispatch ({ reinterpret_cast<const uint32_t*> (packet->words),
+                                                   (size_t) packet->wordCount },
+                                                 static_cast<double> (samplePos),
+                                                 [this] (const ump::View& v, double time)
+                                                 {
+                                                     incomingUmpEvents.addPacket (v, (int) time);
+                                                 });                
+            }
+            else
+            {
+                umpDispatcher.dispatch ({ reinterpret_cast<const uint32_t*> (packet->words),
+                                                (size_t) packet->wordCount },
+                                                static_cast<double> (samplePos),
+                                                [this] (const ump::View& v, double time)
+                                                {
+                                                     toBytestreamConverter.convert (v, time,
+                                                                         [this] (const ump::BytesOnGroup& x, double t)
+                                                                         {
+                                                                             incomingEvents.addEvent ({ x.bytes.data(), (int) x.bytes.size(), t }, (int) t);
+                                                                         }); 
+                                                });
+            }
 
             packet = MIDIEventPacketNext (packet);
         }
@@ -2094,7 +2143,9 @@ private:
    #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
     AudioUnitHelpers::EventListOutput eventListOutput;
     std::optional<SInt32> hostProtocol;
-    ump::ToBytestreamDispatcher toBytestreamDispatcher { 2048 };
+    ump::ToBytestreamConverter toBytestreamConverter { 2048 };
+    ump::Dispatcher umpDispatcher;
+    UMPBuffer umpEvents, incomingUmpEvents;
    #endif
 
     AudioTimeStamp lastTimeStamp;
@@ -2200,6 +2251,27 @@ private:
             juceFilter->processBlock (buffer, midiBuffer);
         }
     }
+
+   #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+    void processBlock (juce::AudioBuffer<float>& buffer, UMPBuffer& umpBuffer) noexcept
+    {
+        const ScopedLock sl (juceFilter->getCallbackLock());
+        const ScopedPlayHead playhead { *this };
+
+        if (juceFilter->isSuspended())
+        {
+            buffer.clear();
+        }
+        else if (bypassParam == nullptr && isBypassed)
+        {
+            juceFilter->processBlockBypassed (buffer, umpBuffer);
+        }
+        else
+        {
+            juceFilter->processBlock (buffer, umpBuffer);
+        }
+    }
+   #endif
 
     void pushMidiOutput ([[maybe_unused]] UInt32 nFrames) noexcept
     {

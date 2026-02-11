@@ -369,6 +369,21 @@ public:
     void removeMidiInputDeviceCallback (const String& deviceIdentifier,
                                         MidiInputCallback* callback);
 
+
+    /** Sets the MIDI input protocol used when opening new MIDI input devices.
+
+        When set to MIDI_2_0, devices opened by setMidiInputDeviceEnabled() will relay
+        raw UMP packets without conversion. When set to MIDI_1_0 (the default), devices
+        will convert incoming UMP to bytestream MIDI 1.0 messages.
+
+        Changing this does not affect already-open devices; disable and re-enable them
+        to apply the new protocol.
+    */
+    void setMidiInputProtocol (ump::PacketProtocol protocol);
+
+    /** Returns the current MIDI input protocol preference. */
+    ump::PacketProtocol getMidiInputProtocol() const noexcept    { return midiInputProtocol; }
+
     //==============================================================================
     /** Sets a midi output device to use as the default.
 
@@ -528,6 +543,7 @@ private:
     Array<MidiDeviceInfo> midiDeviceInfosFromXml;
     std::vector<std::unique_ptr<MidiInput>> enabledMidiInputs;
     Array<MidiCallbackInfo> midiCallbacks;
+    ump::PacketProtocol midiInputProtocol = ump::PacketProtocol::MIDI_1_0;
 
     MidiDeviceInfo defaultMidiOutputDeviceInfo;
     std::unique_ptr<MidiOutput> defaultMidiOutput;
@@ -555,6 +571,7 @@ private:
     void audioDeviceStoppedInt();
     void audioDeviceErrorInt (const String&);
     void handleIncomingMidiMessageInt (MidiInput*, const MidiMessage&);
+    void handleIncomingUMPPacketInt (MidiInput*, ump::View packet, double time);
     void audioDeviceListChanged();
     void midiDeviceListChanged();
 

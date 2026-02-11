@@ -595,7 +595,12 @@ private:
                             const String& preferredDefaultDeviceName,
                             const AudioDeviceManager::AudioDeviceSetup* preferredSetupOptions)
     {
+        const auto protocol = (processor != nullptr && processor->supportsUMPProcessing())
+                                  ? ump::PacketProtocol::MIDI_2_0
+                                  : ump::PacketProtocol::MIDI_1_0;
+
         deviceManager.addAudioCallback (this);
+        deviceManager.setMidiInputProtocol (protocol);
         deviceManager.addMidiInputDeviceCallback ({}, &player);
 
         reloadAudioDeviceState (enableAudioInput, preferredDefaultDeviceName, preferredSetupOptions);

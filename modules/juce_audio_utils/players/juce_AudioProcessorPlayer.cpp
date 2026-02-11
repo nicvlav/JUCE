@@ -215,6 +215,13 @@ void AudioProcessorPlayer::setDoublePrecisionProcessing (bool doublePrecision)
     }
 }
 
+ump::PacketProtocol AudioProcessorPlayer::getPreferredMidiProtocol() const noexcept
+{
+    return (processor != nullptr && processor->supportsUMPProcessing())
+               ? ump::PacketProtocol::MIDI_2_0
+               : ump::PacketProtocol::MIDI_1_0;
+}
+
 void AudioProcessorPlayer::setMidiOutput (MidiOutput* midiOutputToUse)
 {
     if (midiOutput != midiOutputToUse)
@@ -239,8 +246,18 @@ void AudioProcessorPlayer::audioDeviceIOCallbackWithContext (const float* const*
     // These should have been prepared by audioDeviceAboutToStart()...
     jassert (sampleRate > 0 && blockSize > 0);
 
-    incomingMidi.clear();
-    messageCollector.removeNextBlockOfMessages (incomingMidi, numSamples);
+    const bool useUMP = processor != nullptr && processor->supportsUMPProcessing();
+
+    if (useUMP)
+    {
+        incomingUmp.clear();
+        umpCollector.removeNextBlockOfPackets (incomingUmp, numSamples);
+    }
+    else
+    {
+        incomingMidi.clear();
+        messageCollector.removeNextBlockOfMessages (incomingMidi, numSamples);
+    }
 
     initialiseIoBuffers ({ inputChannelData,  (size_t) numInputChannels },
                          { outputChannelData, (size_t) numOutputChannels },
@@ -308,28 +325,60 @@ void AudioProcessorPlayer::audioDeviceIOCallbackWithContext (const float* const*
 
         if (! processor->isSuspended())
         {
-            if (processor->isUsingDoublePrecision())
+            if (useUMP)
             {
-                conversionBuffer.makeCopyOf (buffer, true);
-                processor->processBlock (conversionBuffer, incomingMidi);
-                buffer.makeCopyOf (conversionBuffer, true);
+                if (processor->isUsingDoublePrecision())
+                {
+                    conversionBuffer.makeCopyOf (buffer, true);
+                    processor->processBlock (conversionBuffer, incomingUmp);
+                    buffer.makeCopyOf (conversionBuffer, true);
+                }
+                else
+                {
+                    processor->processBlock (buffer, incomingUmp);
+                }
             }
             else
             {
-                processor->processBlock (buffer, incomingMidi);
+                if (processor->isUsingDoublePrecision())
+                {
+                    conversionBuffer.makeCopyOf (buffer, true);
+                    processor->processBlock (conversionBuffer, incomingMidi);
+                    buffer.makeCopyOf (conversionBuffer, true);
+                }
+                else
+                {
+                    processor->processBlock (buffer, incomingMidi);
+                }
             }
 
             if (midiOutput != nullptr)
             {
-                if (midiOutput->isBackgroundThreadRunning())
+                if (useUMP)
                 {
-                    midiOutput->sendBlockOfMessages (incomingMidi,
-                                                     Time::getMillisecondCounterHiRes(),
-                                                     sampleRate);
+                    if (midiOutput->isBackgroundThreadRunning())
+                    {
+                        midiOutput->sendUMPBlock (incomingUmp,
+                                                  Time::getMillisecondCounterHiRes(),
+                                                  sampleRate);
+                    }
+                    else
+                    {
+                        midiOutput->sendUMPBlockNow (incomingUmp);
+                    }
                 }
                 else
                 {
-                    midiOutput->sendBlockOfMessagesNow (incomingMidi);
+                    if (midiOutput->isBackgroundThreadRunning())
+                    {
+                        midiOutput->sendBlockOfMessages (incomingMidi,
+                                                         Time::getMillisecondCounterHiRes(),
+                                                         sampleRate);
+                    }
+                    else
+                    {
+                        midiOutput->sendBlockOfMessagesNow (incomingMidi);
+                    }
                 }
             }
 
@@ -358,6 +407,7 @@ void AudioProcessorPlayer::audioDeviceAboutToStart (AudioIODevice* const device)
     resizeChannels();
 
     messageCollector.reset (sampleRate);
+    umpCollector.reset (sampleRate);
 
     currentWorkgroup.reset();
 
@@ -391,6 +441,11 @@ void AudioProcessorPlayer::audioDeviceStopped()
 void AudioProcessorPlayer::handleIncomingMidiMessage (MidiInput*, const MidiMessage& message)
 {
     messageCollector.addMessageToQueue (message);
+}
+
+void AudioProcessorPlayer::handleIncomingUMPPacket (MidiInput*, ump::View packet, double time)
+{
+    umpCollector.addPacketToQueue (packet, time);
 }
 
 //==============================================================================

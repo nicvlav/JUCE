@@ -228,6 +228,7 @@
 #include "midi_io/ump/juce_UMPEndpoints.h"
 #include "midi_io/juce_MidiDevices.h"
 #include "midi_io/juce_MidiMessageCollector.h"
+#include "midi_io/juce_UMPMessageCollector.h"
 
 namespace juce
 {

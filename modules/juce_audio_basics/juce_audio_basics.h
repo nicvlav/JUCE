@@ -138,6 +138,7 @@ JUCE_END_IGNORE_WARNINGS_MSVC
 #include "midi/ump/juce_UMPBytesOnGroup.h"
 #include "midi/ump/juce_UMPDeviceInfo.h"
 #include "midi/ump/juce_UMP.h"
+#include "midi/ump/juce_UMPBuffer.h"
 
 namespace juce
 {

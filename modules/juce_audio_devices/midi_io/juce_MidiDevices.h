@@ -180,10 +180,15 @@ public:
         @param callback          the object that will receive the midi messages from this device,
                                  you can also add and remove receivers with
                                  addCallback() and removeCallback()
+        @param protocol          the packet protocol to use for this device. MIDI_1_0 creates a
+                                 legacy device that converts UMP to bytestream; MIDI_2_0 creates a
+                                 native UMP device that relays raw packets. Defaults to MIDI_1_0.
 
         @see MidiInputCallback, getDevices
     */
-    static std::unique_ptr<MidiInput> openDevice (const String& deviceIdentifier, MidiInputCallback* callback = nullptr);
+    static std::unique_ptr<MidiInput> openDevice (const String& deviceIdentifier,
+                                                  MidiInputCallback* callback = nullptr,
+                                                  ump::PacketProtocol protocol = ump::PacketProtocol::MIDI_1_0);
 
     /** This will try to create a new midi input device (only available on Linux, macOS and iOS).
 
@@ -198,7 +203,9 @@ public:
         @param deviceName  the name of the device to create
         @param callback    the object that will receive the midi messages from this device
     */
-    static std::unique_ptr<MidiInput> createNewDevice (const String& deviceName, MidiInputCallback* callback = nullptr);
+    static std::unique_ptr<MidiInput> createNewDevice (const String& deviceName, 
+                                                       MidiInputCallback* callback = nullptr, 
+                                                       ump::PacketProtocol protocol = ump::PacketProtocol::MIDI_1_0);
 
     //==============================================================================
     /** Starts the device running.
@@ -244,6 +251,9 @@ public:
 
 private:
     class Impl;
+    class UMPImpl;
+    class LegacyImpl;
+
     MidiInput();
 
     //==============================================================================
@@ -298,6 +308,20 @@ public:
                                             [[maybe_unused]] const uint8* messageData,
                                             [[maybe_unused]] int numBytesSoFar,
                                             [[maybe_unused]] double timestamp) {}
+
+    /** Called when a UMP packet arrives from a MidiInput.
+
+    This is called on the MIDI input thread before the packet is converted
+    to MIDI 1.0 bytestream. Avoid doing anything time-consuming here.
+
+    @param source   the MidiInput object that generated the packet
+    @param packet   a View of the incoming UMP packet
+    @param time     the arrival time in milliseconds, equivalent to
+                    `Time::getMillisecondCounterHiRes()`
+    */
+    virtual void handleIncomingUMPPacket (MidiInput* source,
+                                          ump::View packet,
+                                          double time) = 0;
 };
 
 //==============================================================================
@@ -423,10 +447,60 @@ public:
         }
     }
 
-    /** Gets rid of any midi messages that had been added by sendBlockOfMessages().
-    */
-    void clearAllPendingMessages()          { outputThread.clearAllPendingMessages(); }
+    //==============================================================================
+    /** Sends a raw UMP packet immediately, bypassing MIDI 1.0 conversion.
 
+        This sends the packet directly to the underlying ump::Output, preserving
+        full MIDI 2.0 resolution. The output endpoint will automatically convert
+        to the protocol expected by the receiver.
+    */
+    void sendUMPPacketNow (ump::View packet)
+    {
+        ump::Iterator b (packet.data(), packet.size());
+        auto e = std::next (b);
+        connection.send (b, e);
+    }
+
+    /** Sends a block of UMP packets from a UMPBuffer immediately. */
+    void sendUMPBlockNow (const UMPBuffer& buffer)
+    {
+        for (const auto& meta : buffer)
+            sendUMPPacketNow (meta.packet);
+    }
+
+    /** Sends a block of UMP packets at scheduled times in the future.
+
+        This is the UMP equivalent of sendBlockOfMessages(). The internal
+        background thread must have been started with startBackgroundThread().
+
+        @param buffer                       the UMP packets to schedule
+        @param millisecondCounterToStartAt  the base time for the block
+        @param samplesPerSecondForBuffer     used to convert sample positions to real time
+    */
+    void sendUMPBlock (const UMPBuffer& buffer,
+                       double millisecondCounterToStartAt,
+                       double samplesPerSecondForBuffer)
+    {
+        jassert (millisecondCounterToStartAt > 0);
+
+        const auto timeScaleFactor = 1000.0 / samplesPerSecondForBuffer;
+
+        for (const auto& meta : buffer)
+        {
+            OwnedUMPPacket p (meta.packet,
+                              millisecondCounterToStartAt + timeScaleFactor * meta.samplePosition);
+            umpOutputThread.addEvent (p);
+        }
+    }
+
+    /** Gets rid of any pending messages from both MIDI and UMP output queues. */
+    void clearAllPendingMessages()
+    {
+        outputThread.clearAllPendingMessages();
+        umpOutputThread.clearAllPendingMessages();
+    }
+    
+    //==============================================================================
     /** Starts up a background thread so that the device can send blocks of data.
         Call this to get the device ready, before using sendBlockOfMessages().
     */
@@ -434,20 +508,45 @@ public:
     {
         backgroundPackets.reserve (2048);
         outputThread.start();
+        umpOutputThread.start();
     }
 
-    /** Stops the background thread, and clears any pending midi events.
+    /** Stops background threads, and clears any pending events.
         @see startBackgroundThread
     */
-    void stopBackgroundThread()             { outputThread.stop(); }
+    void stopBackgroundThread()
+    {
+        outputThread.stop();
+        umpOutputThread.stop();
+    }
 
-    /** Returns true if the background thread used to send blocks of data is running.
-
+    /** Returns true if the background threads used to send blocks of data are running.
         @see startBackgroundThread, stopBackgroundThread
     */
     bool isBackgroundThreadRunning() const  { return outputThread.isRunning(); }
 
 private:
+    /** Small owning container for a single UMP packet plus a timestamp.
+        Used by the scheduled output thread — ump::View is non-owning, so we
+        need to copy the packet data (max 4 uint32s = 16 bytes).
+    */
+    struct OwnedUMPPacket
+    {
+        std::array<uint32_t, 4> words {};
+        double timeStamp = 0;
+
+        OwnedUMPPacket() = default;
+
+        OwnedUMPPacket (ump::View view, double time) 
+            : timeStamp (time)
+        {
+            std::copy (view.begin(), view.end(), words.begin());
+        }
+
+        ump::View getView() const { return ump::View (words.data()); }
+        double getTimeStamp() const { return timeStamp; }
+    };
+
     MidiOutput (std::shared_ptr<ump::Session>,
                 ump::Output,
                 uint8_t,
@@ -481,6 +580,10 @@ private:
     ScheduledEventThread<MidiMessage> outputThread { [this] (const MidiMessage& message)
     {
         convertAndSend (backgroundPackets, Span { &message, 1 });
+    } };
+    ScheduledEventThread<OwnedUMPPacket> umpOutputThread { [this] (const OwnedUMPPacket& p)
+    {
+        sendUMPPacketNow (p.getView());
     } };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiOutput)

@@ -316,6 +316,67 @@ public:
     virtual void processBlockBypassed (AudioBuffer<double>& buffer,
                                        MidiBuffer& midiMessages);
 
+    //==============================================================================
+    /** Renders the next block using native UMP packets instead of MIDI 1.0.
+
+        The default implementation converts the UMP data to a MidiBuffer and
+        forwards to the MIDI 1.0 processBlock. Override this and return true
+        from supportsUMPProcessing() to receive full-resolution MIDI 2.0 data.
+
+        @see supportsUMPProcessing, UMPBuffer
+    */
+    virtual void processBlock (AudioBuffer<float>& buffer,
+                               UMPBuffer& umpMessages);
+
+    /** Renders the next block using native UMP packets instead of MIDI 1.0
+        (double-precision variant).
+
+        The default implementation converts the UMP data to a MidiBuffer and
+        forwards to the double-precision MIDI 1.0 processBlock. Override this
+        if your processor supports both double precision and native UMP.
+
+        @see supportsDoublePrecisionProcessing, supportsUMPProcessing, UMPBuffer
+    */
+    virtual void processBlock (AudioBuffer<double>& buffer,
+                               UMPBuffer& umpMessages);
+
+    /** Renders the next block when the processor is being bypassed, using
+        native UMP packets instead of MIDI 1.0.
+
+        The default implementation delegates to the MidiBuffer-based
+        processBlockBypassed. Override this if you need bypass-specific
+        behaviour in the UMP path (e.g. latency compensation).
+
+        @see processBlockBypassed, UMPBuffer
+    */
+    virtual void processBlockBypassed (AudioBuffer<float>& buffer,
+                                       UMPBuffer& umpMessages);
+
+    /** Renders the next block when the processor is being bypassed, using
+        native UMP packets instead of MIDI 1.0 (double-precision variant).
+
+        The default implementation delegates to the double-precision
+        MidiBuffer-based processBlockBypassed.
+
+        @see processBlockBypassed, supportsDoublePrecisionProcessing, UMPBuffer
+    */
+    virtual void processBlockBypassed (AudioBuffer<double>& buffer,
+                                       UMPBuffer& umpMessages);
+
+    /** Returns true if this processor implements the UMPBuffer variant of
+        processBlock.
+
+        When this returns true, hosts and wrappers that have access to native
+        UMP data will call the UMPBuffer overload instead of converting to
+        MIDI 1.0 first.
+
+        This must return the same value every time it is called.
+        This may be called by the audio thread, so this should be fast.
+        Ideally, just return a constant.
+
+        The default returns false, so existing processors are unaffected.
+    */
+    virtual bool supportsUMPProcessing() const;
 
     //==============================================================================
     /**
@@ -1671,7 +1732,10 @@ private:
     void getNextBestLayout (const BusesLayout&, BusesLayout&) const;
 
     template <typename floatType>
-    void processBypassed (AudioBuffer<floatType>&, MidiBuffer&);
+    void processBypassed (AudioBuffer<floatType>&, MidiBuffer&);    
+    
+    template <typename floatType>
+    void processBypassed (AudioBuffer<floatType>&, UMPBuffer&);
 
     friend class LADSPAPluginInstance;
 

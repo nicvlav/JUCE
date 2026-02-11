@@ -187,6 +187,11 @@ private:
         owner.handleIncomingMidiMessageInt (source, message);
     }
 
+    void handleIncomingUMPPacket (MidiInput* source, ump::View packet, double time) override
+    {
+        owner.handleIncomingUMPPacketInt (source, packet, time);
+    }
+
     void audioDeviceListChanged() override
     {
         owner.audioDeviceListChanged();
@@ -1198,7 +1203,7 @@ void AudioDeviceManager::setMidiInputDeviceEnabled (const String& identifier, bo
     {
         if (enabled)
         {
-            if (auto midiIn = MidiInput::openDevice (identifier, callbackHandler->getMidiInputCallback()))
+            if (auto midiIn = MidiInput::openDevice (identifier, callbackHandler->getMidiInputCallback(), midiInputProtocol))
             {
                 enabledMidiInputs.push_back (std::move (midiIn));
                 enabledMidiInputs.back()->start();
@@ -1260,6 +1265,20 @@ void AudioDeviceManager::handleIncomingMidiMessageInt (MidiInput* source, const 
             if (mc.deviceIdentifier.isEmpty() || mc.deviceIdentifier == source->getIdentifier())
                 mc.callback->handleIncomingMidiMessage (source, message);
     }
+}
+
+void AudioDeviceManager::setMidiInputProtocol (ump::PacketProtocol protocol)
+{
+    midiInputProtocol = protocol;
+}
+
+void AudioDeviceManager::handleIncomingUMPPacketInt (MidiInput* source, ump::View packet, double time)
+{
+    const ScopedLock sl (midiCallbackLock);
+
+    for (auto& mc : midiCallbacks)
+        if (mc.deviceIdentifier.isEmpty() || mc.deviceIdentifier == source->getIdentifier())
+            mc.callback->handleIncomingUMPPacket (source, packet, time);
 }
 
 //==============================================================================

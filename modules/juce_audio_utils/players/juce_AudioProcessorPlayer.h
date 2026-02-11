@@ -77,6 +77,20 @@ public:
     */
     MidiMessageCollector& getMidiMessageCollector() noexcept        { return messageCollector; }
 
+    /** Returns the UMP message collector that you can feed raw UMP packets to
+        if you want them injected into the UMP stream sent to the processor.
+    */
+    UMPMessageCollector& getUMPMessageCollector() noexcept         { return umpCollector; }
+
+    /** Returns the preferred MIDI input protocol for the current processor.
+
+        Returns MIDI_2_0 if the processor supports native UMP processing,
+        MIDI_1_0 otherwise. This can be used by the AudioDeviceManager or
+        StandalonePluginHolder to decide which protocol to request when
+        opening MIDI input devices.
+    */
+    ump::PacketProtocol getPreferredMidiProtocol() const noexcept;
+
     /** Sets the MIDI output that should be used, if required.
 
         The MIDI output will not be deleted or owned by this object. If the MIDI output is
@@ -108,6 +122,8 @@ public:
     void audioDeviceStopped() override;
     /** @internal */
     void handleIncomingMidiMessage (MidiInput*, const MidiMessage&) override;
+    /** @internal */
+    void handleIncomingUMPPacket (MidiInput*, ump::View, double) override;
 
 private:
     struct NumChannels
@@ -145,6 +161,8 @@ private:
 
     MidiBuffer incomingMidi;
     MidiMessageCollector messageCollector;
+    UMPBuffer incomingUmp;
+    UMPMessageCollector umpCollector;
     MidiOutput* midiOutput = nullptr;
     uint64_t sampleCount = 0;
 

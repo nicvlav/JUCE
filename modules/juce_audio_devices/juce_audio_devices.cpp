@@ -250,6 +250,7 @@ namespace juce
 #include "audio_io/juce_AudioIODevice.cpp"
 #include "audio_io/juce_AudioIODeviceType.cpp"
 #include "midi_io/juce_MidiMessageCollector.cpp"
+#include "midi_io/juce_UMPMessageCollector.cpp"
 #include "sources/juce_AudioSourcePlayer.cpp"
 #include "sources/juce_AudioTransportSource.cpp"
 

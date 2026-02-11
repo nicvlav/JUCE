@@ -602,8 +602,25 @@ void AudioProcessor::processBypassed (AudioBuffer<floatType>& buffer, MidiBuffer
         buffer.clear (ch, 0, buffer.getNumSamples());
 }
 
+template <typename floatType>
+void AudioProcessor::processBypassed (AudioBuffer<floatType>& buffer, UMPBuffer&)
+{
+    // If you hit this assertion then your plug-in is reporting that it introduces
+    // some latency, but you haven't overridden processBlockBypassed to produce
+    // an identical amount of latency. Without identical latency in
+    // processBlockBypassed a host's latency compensation could shift the audio
+    // passing through your bypassed plug-in forward in time.
+    jassert (getLatencySamples() == 0);
+
+    for (int ch = getMainBusNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
+        buffer.clear (ch, 0, buffer.getNumSamples());
+}
+
 void AudioProcessor::processBlockBypassed (AudioBuffer<float>&  buffer, MidiBuffer& midi)    { processBypassed (buffer, midi); }
 void AudioProcessor::processBlockBypassed (AudioBuffer<double>& buffer, MidiBuffer& midi)    { processBypassed (buffer, midi); }
+
+void AudioProcessor::processBlockBypassed (AudioBuffer<float>&  buffer, UMPBuffer& umpMessages)    { processBypassed (buffer, umpMessages); }
+void AudioProcessor::processBlockBypassed (AudioBuffer<double>& buffer, UMPBuffer& umpMessages)    { processBypassed (buffer, umpMessages); }
 
 void AudioProcessor::processBlock ([[maybe_unused]] AudioBuffer<double>& buffer,
                                    [[maybe_unused]] MidiBuffer& midiMessages)
@@ -616,6 +633,29 @@ void AudioProcessor::processBlock ([[maybe_unused]] AudioBuffer<double>& buffer,
 }
 
 bool AudioProcessor::supportsDoublePrecisionProcessing() const
+{
+    return false;
+}
+
+void AudioProcessor::processBlock ([[maybe_unused]] AudioBuffer<float>& buffer,
+                                   [[maybe_unused]] UMPBuffer& umpMessages)
+{
+    // If you hit this assertion then either the caller called UMP 
+    // version of processBlock on a processor which does not
+    // support it, or the implementation forgot to override this method.
+    jassertfalse;
+}
+
+void AudioProcessor::processBlock ([[maybe_unused]] AudioBuffer<double>& buffer,
+                                   [[maybe_unused]] UMPBuffer& umpMessages)
+{
+    // If you hit this assertion then either the caller called the double
+    // precision UMP version of processBlock on a processor which does not
+    // support it, or the implementation forgot to override this method.
+    jassertfalse;
+}
+
+bool AudioProcessor::supportsUMPProcessing() const
 {
     return false;
 }

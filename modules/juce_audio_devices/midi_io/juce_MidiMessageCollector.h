@@ -108,6 +108,8 @@ public:
     void handleNoteOff (MidiKeyboardState*, int midiChannel, int midiNoteNumber, float velocity) override;
     /** @internal */
     void handleIncomingMidiMessage (MidiInput*, const MidiMessage&) override;
+    /** @internal */
+    void handleIncomingUMPPacket(MidiInput *, ump::View, double) override {};
 
 private:
     //==============================================================================

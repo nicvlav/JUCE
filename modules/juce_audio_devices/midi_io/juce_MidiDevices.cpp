@@ -107,21 +107,8 @@ public:
                                             uint8_t group,
                                             const MidiDeviceInfo& info,
                                             MidiInputCallback* cb,
-                                            ump::LegacyVirtualInput virtualEndpoint)
-    {
-        auto result = rawToUniquePtr (new MidiInput);
-        result->pimpl = rawToUniquePtr (new Impl (session,
-                                                  std::move (connection),
-                                                  group,
-                                                  result.get(),
-                                                  info,
-                                                  std::move (virtualEndpoint)));
-
-        if (cb != nullptr)
-            result->addCallback (*cb);
-
-        return result;
-    }
+                                            ump::LegacyVirtualInput virtualEndpoint,
+                                            ump::PacketProtocol protocol = ump::PacketProtocol::MIDI_1_0);
 
     uint8_t getGroup() const
     {
@@ -155,6 +142,26 @@ private:
         connection.addConsumer (*this);
     }
 
+protected:
+    std::shared_ptr<ump::Session> session;
+    ump::LegacyVirtualInput virtualEndpoint;
+    std::optional<String> customName;
+    ump::Input connection;
+    MidiDeviceInfo storedInfo;
+    WaitFreeListeners<MidiInputCallback> callbacks;
+    uint8_t group{};
+    MidiInput* owner = nullptr;
+    SpinLock spinLock;
+    bool active = false;
+};
+
+//==============================================================================
+/** Legacy MIDI 1.0 implementation — converts incoming UMP to bytestream. */
+class MidiInput::LegacyImpl final : public MidiInput::Impl
+{
+  private:
+    using Impl::Impl;
+
     void consume (ump::Iterator b, ump::Iterator e, double time) override
     {
         const SpinLock::ScopedTryLockType lock { spinLock };
@@ -179,18 +186,72 @@ private:
         }
     }
 
-    std::shared_ptr<ump::Session> session;
-    ump::LegacyVirtualInput virtualEndpoint;
-    std::optional<String> customName;
-    ump::Input connection;
-    MidiDeviceInfo storedInfo;
     ump::ToBytestreamConverter converter { 4096 };
-    WaitFreeListeners<MidiInputCallback> callbacks;
-    uint8_t group{};
-    MidiInput* owner = nullptr;
-    SpinLock spinLock;
-    bool active = false;
 };
+
+//==============================================================================
+/** Native UMP implementation — relays raw UMP packets without conversion. */
+class MidiInput::UMPImpl final : public MidiInput::Impl
+{
+  private:
+    using Impl::Impl;
+
+    void consume (ump::Iterator b, ump::Iterator e, double time) override
+    {
+        const SpinLock::ScopedTryLockType lock { spinLock };
+
+        if (!lock.isLocked() || !active)
+            return;
+
+        for (const auto& view : makeRange (b, e))
+        {
+            if (ump::Utils::getGroup (view[0]) != group)
+                continue;
+
+            callbacks.call ([&] (MidiInputCallback& l) {
+                l.handleIncomingUMPPacket (owner, view, time);
+            });
+        }
+    }
+};
+
+//==============================================================================
+std::unique_ptr<MidiInput> MidiInput::Impl::make (std::shared_ptr<ump::Session> session,
+                                                  ump::Input connection,
+                                                  uint8_t group,
+                                                  const MidiDeviceInfo& info,
+                                                  MidiInputCallback* cb,
+                                                  ump::LegacyVirtualInput virtualEndpoint,
+                                                  ump::PacketProtocol protocol)
+{
+    auto result = rawToUniquePtr (new MidiInput);
+
+    if (protocol == ump::PacketProtocol::MIDI_2_0)
+    {
+        // ump impl relays ump to callbacks
+        result->pimpl = rawToUniquePtr (new UMPImpl (session,
+                                                     std::move (connection),
+                                                     group,
+                                                     result.get(),
+                                                     info,
+                                                     std::move (virtualEndpoint)));
+    }
+    else
+    {
+        // legacy impl converts ump to bytestream
+        result->pimpl = rawToUniquePtr (new LegacyImpl (session,
+                                                        std::move (connection),
+                                                        group,
+                                                        result.get(),
+                                                        info,
+                                                        std::move (virtualEndpoint)));
+    }
+
+    if (cb != nullptr)
+        result->addCallback (*cb);
+
+    return result;
+}
 
 MidiInput::MidiInput() = default;
 MidiInput::~MidiInput() = default;
@@ -207,7 +268,9 @@ MidiDeviceInfo MidiInput::getDefaultDevice()
     return getAvailableDevices().getFirst();
 }
 
-std::unique_ptr<MidiInput> MidiInput::openDevice (const String& deviceIdentifier, MidiInputCallback* callback)
+std::unique_ptr<MidiInput> MidiInput::openDevice (const String& deviceIdentifier,
+                                                  MidiInputCallback* callback,
+                                                  ump::PacketProtocol protocol)
 {
     const auto address = MidiDeviceListConnectionBroadcaster::get().getEndpointGroupForId (ump::IOKind::src, deviceIdentifier);
 
@@ -224,12 +287,12 @@ std::unique_ptr<MidiInput> MidiInput::openDevice (const String& deviceIdentifier
     if (session == nullptr)
         return {};
 
-    auto connection = session->connectInput (address->endpointId, ump::PacketProtocol::MIDI_1_0);
+    auto connection = session->connectInput (address->endpointId, protocol);
 
     if (! connection.isAlive())
         return {};
 
-    return Impl::make (session, std::move (connection), address->group, *info, callback, {});
+    return Impl::make (session, std::move (connection), address->group, *info, callback, {}, protocol);
 }
 
 static inline bool isValidMidi1VirtualEndpoint (const std::optional<ump::Endpoint>& ep,
@@ -262,7 +325,9 @@ static inline bool isValidMidi1VirtualEndpoint (const std::optional<ump::Endpoin
     return true;
 }
 
-std::unique_ptr<MidiInput> MidiInput::createNewDevice (const String& name, MidiInputCallback* callback)
+std::unique_ptr<MidiInput> MidiInput::createNewDevice (const String& name,
+                                                       MidiInputCallback* callback,
+                                                       ump::PacketProtocol protocol)
 {
     auto session = getLegacySession();
 
@@ -277,13 +342,13 @@ std::unique_ptr<MidiInput> MidiInput::createNewDevice (const String& name, MidiI
     jassert (isValidMidi1VirtualEndpoint (ump::Endpoints::getInstance()->getEndpoint (port.getId()),
                                           ump::BlockDirection::receiver));
 
-    auto connection = session->connectInput (port.getId(), ump::PacketProtocol::MIDI_1_0);
+    auto connection = session->connectInput (port.getId(), protocol);
 
     if (! connection)
         return {};
 
     const auto portId = port.getId().dst;
-    return Impl::make (session, std::move (connection), 0, { name, portId }, callback, std::move (port));
+    return Impl::make (session, std::move (connection), 0, { name, portId }, callback, std::move (port), protocol);
 }
 
 void MidiInput::start()

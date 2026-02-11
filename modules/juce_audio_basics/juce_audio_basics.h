@@ -110,7 +110,6 @@ JUCE_END_IGNORE_WARNINGS_MSVC
 #include "midi/juce_MidiBuffer.h"
 #include "midi/juce_MidiMessageSequence.h"
 #include "midi/juce_MidiFile.h"
-#include "midi/juce_MidiKeyboardState.h"
 #include "midi/juce_MidiRPN.h"
 #include "midi/juce_MidiDataConcatenator.h"
 #include "mpe/juce_MPEValue.h"
@@ -139,6 +138,7 @@ JUCE_END_IGNORE_WARNINGS_MSVC
 #include "midi/ump/juce_UMPDeviceInfo.h"
 #include "midi/ump/juce_UMP.h"
 #include "midi/ump/juce_UMPBuffer.h"
+#include "midi/juce_MidiKeyboardState.h"
 
 namespace juce
 {

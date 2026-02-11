@@ -144,6 +144,52 @@ void MidiKeyboardState::processNextMidiEvent (const MidiMessage& message)
     }
 }
 
+void MidiKeyboardState::processNextUmpEvent (ump::View packet)
+{
+    const auto firstWord = packet[0];
+    const auto messageType = ump::Utils::getMessageType (firstWord);
+    const auto status = ump::Utils::getStatus (firstWord);
+    const auto channel = static_cast<int> (ump::Utils::getChannel (firstWord)) + 1;
+
+    if (messageType == ump::Utils::MessageKind::channelVoice1)
+    {
+        const auto byte2 = ump::Utils::U8<2>::get (firstWord);
+        const auto byte3 = ump::Utils::U8<3>::get (firstWord);
+
+        if (status == std::byte { 0x9 } && byte3 > 0)
+            noteOnInternal (channel, static_cast<int> (byte2), byte3 / 127.0f);
+        else if (status == std::byte { 0x8 } || (status == std::byte { 0x9 } && byte3 == 0))
+            noteOffInternal (channel, static_cast<int> (byte2), byte3 / 127.0f);
+        else if (status == std::byte { 0xb } && byte2 == 123) // CC 123 = All Notes Off
+            for (int i = 0; i < 128; ++i)
+                noteOffInternal (channel, i, 0.0f);
+    }
+    else if (messageType == ump::Utils::MessageKind::channelVoice2)
+    {
+        const auto byte2 = ump::Utils::U8<2>::get (firstWord);
+
+        if (status == std::byte { 0x9 })
+        {
+            const auto velocity16bit = ump::Utils::U16<2>::get (packet[1]);
+
+            if (velocity16bit > 0)
+                noteOnInternal (channel, static_cast<int> (byte2), velocity16bit / 65535.0f);
+            else
+                noteOffInternal (channel, static_cast<int> (byte2), 0.0f);
+        }
+        else if (status == std::byte { 0x8 })
+        {
+            const auto velocity16bit = ump::Utils::U16<2>::get (packet[1]);
+            noteOffInternal (channel, static_cast<int> (byte2), velocity16bit / 65535.0f);
+        }
+        else if (status == std::byte { 0xb } && byte2 == 123) // CC 123 = All Notes Off
+        {
+            for (int i = 0; i < 128; ++i)
+                noteOffInternal (channel, i, 0.0f);
+        }
+    }
+}
+
 void MidiKeyboardState::processNextMidiBuffer (MidiBuffer& buffer,
                                                const int startSample,
                                                const int numSamples,
@@ -163,6 +209,39 @@ void MidiKeyboardState::processNextMidiBuffer (MidiBuffer& buffer,
         {
             const auto pos = jlimit (0, numSamples - 1, roundToInt ((metadata.samplePosition - firstEventToAdd) * scaleFactor));
             buffer.addEvent (metadata.getMessage(), startSample + pos);
+        }
+    }
+
+    eventsToAdd.clear();
+}
+
+void MidiKeyboardState::processNextUmpBuffer (UMPBuffer& buffer,
+                                              const int startSample,
+                                              const int numSamples,
+                                              const bool injectIndirectEvents)
+{
+    const ScopedLock sl (lock);
+
+    for (const auto& meta : buffer)
+        processNextUmpEvent (meta.packet);
+
+    if (injectIndirectEvents && ! eventsToAdd.isEmpty())
+    {
+        const int firstEventToAdd = eventsToAdd.getFirstEventTime();
+        const double scaleFactor = numSamples / (double) (eventsToAdd.getLastEventTime() + 1 - firstEventToAdd);
+
+        // Convert pending MIDI 1.0 events to UMP and inject
+        ump::ToUMP1Converter converter;
+
+        for (const auto metadata : eventsToAdd)
+        {
+            const auto pos = jlimit (0, numSamples - 1, roundToInt ((metadata.samplePosition - firstEventToAdd) * scaleFactor));
+            const auto msg = metadata.getMessage();
+
+            converter.convert ({ {}, msg.asSpan() }, [&buffer, samplePos = startSample + pos] (const ump::View& view)
+            {
+                buffer.addPacket (view, samplePos);
+            });
         }
     }
 

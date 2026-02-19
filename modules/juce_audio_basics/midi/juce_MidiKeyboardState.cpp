@@ -170,7 +170,7 @@ void MidiKeyboardState::processNextUmpEvent (ump::View packet)
 
         if (status == std::byte { 0x9 })
         {
-            const auto velocity16bit = ump::Utils::U16<2>::get (packet[1]);
+            const auto velocity16bit = ump::Utils::U16<0>::get (packet[1]);
 
             if (velocity16bit > 0)
                 noteOnInternal (channel, static_cast<int> (byte2), velocity16bit / 65535.0f);
@@ -179,7 +179,7 @@ void MidiKeyboardState::processNextUmpEvent (ump::View packet)
         }
         else if (status == std::byte { 0x8 })
         {
-            const auto velocity16bit = ump::Utils::U16<2>::get (packet[1]);
+            const auto velocity16bit = ump::Utils::U16<0>::get (packet[1]);
             noteOffInternal (channel, static_cast<int> (byte2), velocity16bit / 65535.0f);
         }
         else if (status == std::byte { 0xb } && byte2 == 123) // CC 123 = All Notes Off

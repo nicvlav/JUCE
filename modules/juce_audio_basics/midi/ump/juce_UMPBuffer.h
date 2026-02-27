@@ -123,25 +123,24 @@ public:
         const auto totalSize = 1 + numWords;   // 1 word for timestamp + packet words
 
         // Find insertion point: past all events with timestamp <= samplePosition
-        auto* d = findEventAfter (data.data(), data.data() + data.size(), samplePosition);
-        auto offset = static_cast<size_t> (d - data.data());
+        auto* d = findEventAfter (data.getRawDataPointer(), data.getRawDataPointer() + data.size(), samplePosition);
+        auto offset = static_cast<int> (d - data.getRawDataPointer());
 
-        data.insert (data.begin() + static_cast<std::ptrdiff_t> (offset),
-                     totalSize, uint32_t (0));
+        data.insertMultiple (offset, uint32_t (0), static_cast<int> (totalSize));
 
-        auto* dest = data.data() + offset;
+        auto* dest = data.getRawDataPointer() + offset;
         *dest++ = static_cast<uint32_t> (samplePosition);
-        std::copy_n (packet.begin(), numWords, dest);
+        std::copy_n (packet.data(), numWords, dest);
     }
 
     /** Removes all packets without deallocating storage. */
     void clear() noexcept
     {
-        data.clear();
+        data.clearQuick();
     }
 
     /** Returns true if the buffer contains no packets. */
-    bool isEmpty() const noexcept { return data.empty(); }
+    bool isEmpty() const noexcept { return data.isEmpty(); }
 
     /** Returns the number of packets in the buffer.
         Note: this is O(n) as it walks the interleaved stream.
@@ -149,7 +148,7 @@ public:
     int getNumPackets() const noexcept
     {
         int n = 0;
-        auto* d   = data.data();
+        auto* d   = data.getRawDataPointer();
         auto* end = d + data.size();
 
         while (d < end)
@@ -164,16 +163,16 @@ public:
     /** Returns the sample position of the first packet, or 0 if empty. */
     int getFirstEventTime() const noexcept
     {
-        return data.empty() ? 0 : getEventTime (data.data());
+        return data.isEmpty() ? 0 : getEventTime (data.getRawDataPointer());
     }
 
     /** Returns the sample position of the last packet, or 0 if empty. */
     int getLastEventTime() const noexcept
     {
-        if (data.empty())
+        if (data.isEmpty())
             return 0;
 
-        auto* d   = data.data();
+        auto* d   = data.getRawDataPointer();
         auto* end = d + data.size();
 
         for (;;)
@@ -195,7 +194,7 @@ public:
     */
     void swapWith (UMPBuffer& other) noexcept
     {
-        data.swap (other.data);
+        data.swapWith (other.data);
     }
 
     /** Pre-allocates storage to avoid allocation during processing.
@@ -205,7 +204,7 @@ public:
     */
     void ensureSize (size_t numWords)
     {
-        data.reserve (numWords);
+        data.ensureStorageAllocated (static_cast<int> (numWords));
     }
 
     //==============================================================================
@@ -302,15 +301,15 @@ public:
     /** Returns a const iterator past the last packet. */
     Iterator end() const noexcept   { return cend(); }
     /** Returns an iterator to the first packet. */
-    Iterator cbegin() const noexcept { return { data.data(), data.data() + data.size() }; }
+    Iterator cbegin() const noexcept { return { data.getRawDataPointer(), data.getRawDataPointer() + data.size() }; }
 
     /** Returns an iterator past the last packet. */
-    Iterator cend() const noexcept   { auto* e = data.data() + data.size(); return { e, e }; }
+    Iterator cend() const noexcept   { auto* e = data.getRawDataPointer() + data.size(); return { e, e }; }
     
     /** Returns the first iterator whose sample position is >= @p samplePosition. */
     Iterator findNextSamplePosition (int samplePosition) const noexcept
     {
-        auto* d   = data.data();
+        auto* d   = data.getRawDataPointer();
         auto* end = d + data.size();
 
         while (d < end && getEventTime (d) < samplePosition)
@@ -321,7 +320,7 @@ public:
 
 private:
     //==============================================================================
-    std::vector<uint32_t> data;
+    Array<uint32_t> data;
 
     /** Reads the sample position from the first word of an event. */
     static int getEventTime (const uint32_t* d) noexcept

@@ -836,6 +836,7 @@ static void setValueAndNotifyIfChanged (AudioProcessorParameter& param, float ne
 //==============================================================================
 class JuceVST3EditController final : public Vst::EditController,
                                      public Vst::IMidiMapping,
+                                     public Vst::INoteExpressionController,
                                      public Vst::IUnitInfo,
                                      public Vst::IRemapParamID,
                                      public Vst::ChannelContext::IInfoListener,
@@ -1293,6 +1294,50 @@ public:
     }
 
     //==============================================================================
+    // INoteExpressionController
+    //
+    // Kept as a minimal stub — we declare 0 custom types. The upcoming VST3 SDK
+    // defines host-managed MIDI 2.0 Note-On Attribute types in the 203000-203255
+    // range (NoteExpressionTypeIDsMidi2::kMidi2NoteOnAttributeStart). These are
+    // owned by the host, not declared by the plugin. We implement the interface
+    // so the host knows we understand NoteExpression events.
+    //
+    // FIXME: Review when the VST3 SDK ships kMidi2NoteOnAttributeStart — the host
+    // may require specific declarations or a capability flag instead.
+
+    Steinberg::int32 PLUGIN_API getNoteExpressionCount (Steinberg::int32 /*busIndex*/,
+                                                         Steinberg::int16 /*channel*/) override
+    {
+        return 0;
+    }
+
+    Steinberg::tresult PLUGIN_API getNoteExpressionInfo (Steinberg::int32 /*busIndex*/,
+                                                          Steinberg::int16 /*channel*/,
+                                                          Steinberg::int32 /*noteExpressionIndex*/,
+                                                          Steinberg::Vst::NoteExpressionTypeInfo& /*info*/) override
+    {
+        return Steinberg::kResultFalse;
+    }
+
+    Steinberg::tresult PLUGIN_API getNoteExpressionStringByValue (Steinberg::int32 /*busIndex*/,
+                                                                   Steinberg::int16 /*channel*/,
+                                                                   Steinberg::Vst::NoteExpressionTypeID /*id*/,
+                                                                   Steinberg::Vst::NoteExpressionValue /*valueNormalized*/,
+                                                                   Steinberg::Vst::String128 /*string*/) override
+    {
+        return Steinberg::kResultFalse;
+    }
+
+    Steinberg::tresult PLUGIN_API getNoteExpressionValueByString (Steinberg::int32 /*busIndex*/,
+                                                                   Steinberg::int16 /*channel*/,
+                                                                   Steinberg::Vst::NoteExpressionTypeID /*id*/,
+                                                                   const Steinberg::Vst::TChar* /*string*/,
+                                                                   Steinberg::Vst::NoteExpressionValue& /*valueNormalized*/) override
+    {
+        return Steinberg::kResultFalse;
+    }
+
+    //==============================================================================
     Steinberg::int32 PLUGIN_API getUnitCount() override
     {
         if (audioProcessor != nullptr)
@@ -1689,6 +1734,7 @@ private:
                                              UniqueBase<Vst::IEditController2>{},
                                              UniqueBase<Vst::IConnectionPoint>{},
                                              UniqueBase<Vst::IMidiMapping>{},
+                                             UniqueBase<Vst::INoteExpressionController>{},
                                              UniqueBase<Vst::IUnitInfo>{},
                                              UniqueBase<Vst::IRemapParamID>{},
                                              UniqueBase<Vst::ChannelContext::IInfoListener>{},
@@ -3588,7 +3634,17 @@ public:
 
        #if JucePlugin_WantsMidiInput
         if (isMidiInputBusEnabled && data.inputEvents != nullptr)
-            MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);
+        {
+           #if JUCE_DEBUG_VST3_EVENTS
+            VST3EventDebugLogger::logEventList (*data.inputEvents);
+           #endif
+
+            // When the processor supports UMP, IEventList conversion happens in
+            // processAudio() via toUMPBufferWithExpressions() so that NoteExpression
+            // data can be merged into UMP note-on attributes.
+            if (! pluginInstance->supportsUMPProcessing())
+                MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);
+        }
        #endif
 
         if (detail::PluginUtilities::getHostType().isWavelab())
@@ -3718,6 +3774,26 @@ private:
             if (pluginInstance->isSuspended())
             {
                 buffer.clear();
+            }
+            else if (pluginInstance->supportsUMPProcessing())
+            {
+                // UMP path: convert IEventList directly to UMPBuffer, preserving
+                // NoteExpression data as MIDI 2.0 note-on attributes.
+                umpProcessBuffer.clear();
+
+                // Parameter CC changes were already placed in midiBuffer by
+                // processParameterChanges(); convert them to UMP.
+                umpProcessBuffer.addFromMidiBuffer (midiBuffer);
+
+               #if JucePlugin_WantsMidiInput
+                if (isMidiInputBusEnabled && data.inputEvents != nullptr)
+                    MidiEventList::toUMPBufferWithExpressions (umpProcessBuffer, *data.inputEvents);
+               #endif
+
+                if (pluginInstance->getBypassParameter() == nullptr && comPluginInstance->getBypassParameter()->getValue() >= 0.5f)
+                    pluginInstance->processBlockBypassed (buffer, umpProcessBuffer);
+                else
+                    pluginInstance->processBlock (buffer, umpProcessBuffer);
             }
             else
             {
@@ -3854,6 +3930,7 @@ private:
     Vst::ProcessSetup processSetup;
 
     MidiBuffer midiBuffer;
+    UMPBuffer umpProcessBuffer;
     ClientBufferMapper bufferMapper;
 
     bool active = false;

@@ -1192,6 +1192,168 @@ public:
         }
     }
 
+    //==============================================================================
+    /** Converts a VST3 IEventList to a UMPBuffer using MIDI 2.0 Channel Voice messages.
+
+        kNoteExpressionIntValueEvent events with typeIds in the MIDI 2.0 Note-On
+        Attribute range (203000-203255) are merged into UMP note-on attribute fields
+        via a two-pass algorithm:
+          Pass 1 — collect attribute values keyed by noteId.
+          Pass 2 — convert events; note-ons look up their noteId to embed attributes.
+
+        FIXME: kMidi2NoteOnAttributeStart/End are hardcoded from Steinberg's
+        upcoming NoteExpressionTypeIDsMidi2 enum. Replace with SDK constants
+        when the VST3 SDK ships this update.
+
+        @param result     destination UMPBuffer (not cleared — appends)
+        @param eventList  the host's IEventList from ProcessData::inputEvents
+    */
+
+    // MIDI 2.0 Note-On Attribute NoteExpression type ID range (upcoming VST3 SDK).
+    // Each typeId maps directly to UMP Note-On attribute type: attrType = typeId - 203000.
+    // The attribute data (16 bits) is in the lower 16 bits of the uint64 value field.
+    static constexpr Steinberg::Vst::NoteExpressionTypeID kMidi2NoteOnAttributeStart = 203000;
+    static constexpr Steinberg::Vst::NoteExpressionTypeID kMidi2NoteOnAttributeEnd   = 203255;
+
+    static void toUMPBufferWithExpressions (UMPBuffer& result,
+                                            Steinberg::Vst::IEventList& eventList)
+    {
+        using namespace Steinberg;
+        using namespace Steinberg::Vst;
+
+        const auto numEvents = eventList.getEventCount();
+        if (numEvents == 0)
+            return;
+
+        // ---- Pass 1: collect MIDI 2.0 Note-On Attribute values by noteId ----
+        // Use a small inline array to avoid heap allocation in the common case.
+        struct NoteExprAttr { int32 noteId; uint8_t attrType; uint16_t attrData; };
+        constexpr int maxInlineAttrs = 32;
+        NoteExprAttr attrStorage[maxInlineAttrs];
+        int attrCount = 0;
+
+        for (int32 i = 0; i < numEvents; ++i)
+        {
+            Event e;
+            if (eventList.getEvent (i, e) != kResultOk)
+                continue;
+
+            // kNoteExpressionIntValueEvent (uint64) — the proper MIDI 2.0 path
+            if (e.type == Event::kNoteExpressionIntValueEvent
+                && e.noteExpressionIntValue.typeId >= kMidi2NoteOnAttributeStart
+                && e.noteExpressionIntValue.typeId <= kMidi2NoteOnAttributeEnd
+                && e.noteExpressionIntValue.noteId >= 0)
+            {
+                auto aType = static_cast<uint8_t> (e.noteExpressionIntValue.typeId - kMidi2NoteOnAttributeStart);
+                auto aData = static_cast<uint16_t> (e.noteExpressionIntValue.value & 0xFFFF);
+
+                if (attrCount < maxInlineAttrs)
+                    attrStorage[attrCount++] = { e.noteExpressionIntValue.noteId, aType, aData };
+            }
+        }
+
+        // Helper to look up attributes for a noteId
+        auto findAttr = [&] (int32 noteId) -> const NoteExprAttr*
+        {
+            for (int j = 0; j < attrCount; ++j)
+                if (attrStorage[j].noteId == noteId)
+                    return &attrStorage[j];
+            return nullptr;
+        };
+
+        // ---- Pass 2: convert events to UMP ----
+        for (int32 i = 0; i < numEvents; ++i)
+        {
+            Event e;
+            if (eventList.getEvent (i, e) != kResultOk)
+                continue;
+
+            switch (e.type)
+            {
+                case Event::kNoteOnEvent:
+                {
+                    auto channel  = static_cast<uint8_t> (juce::jlimit (0, 15, (int) e.noteOn.channel));
+                    auto note     = static_cast<uint8_t> (juce::jlimit (0, 127, (int) e.noteOn.pitch));
+                    auto vel16    = static_cast<uint16_t> (juce::jlimit (0, 65535,
+                                       (int) std::round (e.noteOn.velocity * 65535.0f)));
+
+                    auto attrKind = ump::Factory::NoteAttributeKind::none;
+                    uint16_t attrData = 0;
+
+                    if (auto* a = findAttr (e.noteOn.noteId))
+                    {
+                        attrKind = static_cast<ump::Factory::NoteAttributeKind> (a->attrType);
+                        attrData = a->attrData;
+                    }
+
+                    auto pkt = ump::Factory::makeNoteOnV2 (0, channel, note, attrKind, vel16, attrData);
+                    result.addPacket (ump::View { pkt.data() }, e.sampleOffset);
+                    break;
+                }
+
+                case Event::kNoteOffEvent:
+                {
+                    auto channel = static_cast<uint8_t> (juce::jlimit (0, 15, (int) e.noteOff.channel));
+                    auto note    = static_cast<uint8_t> (juce::jlimit (0, 127, (int) e.noteOff.pitch));
+                    auto vel16   = static_cast<uint16_t> (juce::jlimit (0, 65535,
+                                       (int) std::round (e.noteOff.velocity * 65535.0f)));
+
+                    auto pkt = ump::Factory::makeNoteOffV2 (0, channel, note,
+                                                            ump::Factory::NoteAttributeKind::none, vel16, 0);
+                    result.addPacket (ump::View { pkt.data() }, e.sampleOffset);
+                    break;
+                }
+
+                case Event::kPolyPressureEvent:
+                {
+                    auto channel  = static_cast<uint8_t> (juce::jlimit (0, 15, (int) e.polyPressure.channel));
+                    auto note     = static_cast<uint8_t> (juce::jlimit (0, 127, (int) e.polyPressure.pitch));
+                    auto pressure = static_cast<uint32_t> (std::round (e.polyPressure.pressure * 4294967295.0f));
+
+                    auto pkt = ump::Factory::makePolyPressureV2 (0, channel, note, pressure);
+                    result.addPacket (ump::View { pkt.data() }, e.sampleOffset);
+                    break;
+                }
+
+                case Event::kDataEvent:
+                {
+                    if (e.data.type == DataEvent::kMidiSysEx && e.data.bytes != nullptr && e.data.size >= 2)
+                    {
+                        auto msg = MidiMessage::createSysExMessage (e.data.bytes + 1, (int) e.data.size - 2);
+                        MidiBuffer tempBuf;
+                        tempBuf.addEvent (msg, e.sampleOffset);
+                        result.addFromMidiBuffer (tempBuf);
+                    }
+                    break;
+                }
+
+                case Event::kLegacyMIDICCOutEvent:
+                {
+                    if (const auto msg = toMidiMessage (e))
+                    {
+                        MidiBuffer tempBuf;
+                        tempBuf.addEvent (*msg, e.sampleOffset);
+                        result.addFromMidiBuffer (tempBuf);
+                    }
+                    break;
+                }
+
+                case Event::kNoteExpressionValueEvent:
+                case Event::kNoteExpressionTextEvent:
+                case Event::kNoteExpressionIntValueEvent:
+                    // MIDI 2.0 attribute expressions consumed in pass 1.
+                    // Other expression types (Volume, Tuning, etc.) could be mapped
+                    // to UMP per-note controllers here in the future.
+                    break;
+
+                case Event::kChordEvent:
+                case Event::kScaleEvent:
+                default:
+                    break;
+            }
+        }
+    }
+
     template <typename Callback>
     static void hostToPluginEventList (Steinberg::Vst::IEventList& result,
                                        MidiBuffer& midiBuffer,
@@ -1569,6 +1731,213 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiEventList)
 };
+
+//==============================================================================
+/*  Debug logging for VST3 IEventList events.
+
+    Enable by defining JUCE_DEBUG_VST3_EVENTS=1 before including this header,
+    or in your project preprocessor definitions. When enabled, all events from
+    the host's IEventList are logged via DBG() with full field detail, including
+    NoteExpression types, event flags, note attributes, and articulation data
+    that JUCE normally discards.
+
+    WARNING: This logs on the audio thread using DBG(). Use only for debugging.
+*/
+#ifndef JUCE_DEBUG_VST3_EVENTS
+ #define JUCE_DEBUG_VST3_EVENTS 0
+#endif
+
+#if JUCE_DEBUG_VST3_EVENTS
+struct VST3EventDebugLogger
+{
+    static juce::String noteExpressionTypeName (Steinberg::Vst::NoteExpressionTypeID typeId)
+    {
+        using namespace Steinberg::Vst;
+        switch (typeId)
+        {
+            case kVolumeTypeID:     return "Volume";
+            case kPanTypeID:        return "Pan";
+            case kTuningTypeID:     return "Tuning";
+            case kVibratoTypeID:    return "Vibrato";
+            case kExpressionTypeID: return "Expression";
+            case kBrightnessTypeID: return "Brightness";
+            case kTextTypeID:       return "Text";
+            case kPhonemeTypeID:    return "Phoneme";
+            default:
+                // MIDI 2.0 Note-On Attribute range (upcoming VST3 SDK)
+                if (typeId >= 203000 && typeId <= 203255)
+                    return "MIDI2 NoteOnAttr(0x" + juce::String::toHexString ((int)(typeId - 203000)).paddedLeft ('0', 2) + ")";
+                if (typeId >= 204000 && typeId <= 204255)
+                    return "MIDI2 NoteOffAttr(0x" + juce::String::toHexString ((int)(typeId - 204000)).paddedLeft ('0', 2) + ")";
+                if (typeId >= kCustomStart && typeId <= kCustomEnd)
+                    return "Custom(" + juce::String (typeId) + ")";
+                return "Unknown(" + juce::String (typeId) + ")";
+        }
+    }
+
+    static juce::String eventFlagsToString (Steinberg::uint16 flags)
+    {
+        juce::String result;
+        if (flags & Steinberg::Vst::Event::kIsLive)        result += "LIVE ";
+        if (flags & Steinberg::Vst::Event::kUserReserved1) result += "USR1 ";
+        if (flags & Steinberg::Vst::Event::kUserReserved2) result += "USR2 ";
+
+         const auto known = (Steinberg::uint16) (Steinberg::Vst::Event::kIsLive
+                                               | Steinberg::Vst::Event::kUserReserved1
+                                               | Steinberg::Vst::Event::kUserReserved2);
+        if (flags & ~known)
+            result += "0x" + juce::String::toHexString ((int) flags) + " ";
+
+        return result.isEmpty() ? "none" : result.trimEnd();
+    }
+
+    static juce::String eventTypeName (Steinberg::uint16 type)
+    {
+        using namespace Steinberg::Vst;
+        switch (type)
+        {
+            case Event::kNoteOnEvent:                return "NoteOn";
+            case Event::kNoteOffEvent:               return "NoteOff";
+            case Event::kDataEvent:                  return "Data";
+            case Event::kPolyPressureEvent:          return "PolyPressure";
+            case Event::kNoteExpressionValueEvent:   return "NoteExprValue";
+            case Event::kNoteExpressionTextEvent:    return "NoteExprText";
+            case Event::kChordEvent:                 return "Chord";
+            case Event::kScaleEvent:                 return "Scale";
+            case Event::kNoteExpressionIntValueEvent: return "NoteExprInt";
+            case Event::kLegacyMIDICCOutEvent:       return "LegacyMIDICCOut";
+            default: return "Unknown(" + juce::String (type) + ")";
+        }
+    }
+
+    static void logEventList (Steinberg::Vst::IEventList& eventList)
+    {
+        const auto numEvents = eventList.getEventCount();
+        if (numEvents == 0)
+            return;
+
+        DBG ("=== VST3 IEventList: " + juce::String (numEvents) + " event(s) ===");
+
+        for (Steinberg::int32 i = 0; i < numEvents; ++i)
+        {
+            Steinberg::Vst::Event e;
+
+            if (eventList.getEvent (i, e) != Steinberg::kResultOk)
+            {
+                DBG ("  [" + juce::String (i) + "] FAILED to retrieve event");
+                continue;
+            }
+
+            juce::String hdr = "  [" + juce::String (i) + "] "
+                             + eventTypeName (e.type)
+                             + " bus=" + juce::String (e.busIndex)
+                             + " smp=" + juce::String (e.sampleOffset)
+                             + " ppq=" + juce::String (e.ppqPosition, 4)
+                             + " flags=[" + eventFlagsToString (e.flags) + "]";
+
+            switch (e.type)
+            {
+                case Steinberg::Vst::Event::kNoteOnEvent:
+                    DBG (hdr + " ch=" + juce::String (e.noteOn.channel)
+                             + " pitch=" + juce::String (e.noteOn.pitch)
+                             + " vel=" + juce::String (e.noteOn.velocity, 4)
+                             + " tune=" + juce::String (e.noteOn.tuning, 3)
+                             + " len=" + juce::String (e.noteOn.length)
+                             + " noteId=" + juce::String (e.noteOn.noteId));
+                    break;
+
+                case Steinberg::Vst::Event::kNoteOffEvent:
+                    DBG (hdr + " ch=" + juce::String (e.noteOff.channel)
+                             + " pitch=" + juce::String (e.noteOff.pitch)
+                             + " vel=" + juce::String (e.noteOff.velocity, 4)
+                             + " tune=" + juce::String (e.noteOff.tuning, 3)
+                             + " noteId=" + juce::String (e.noteOff.noteId));
+                    break;
+
+                case Steinberg::Vst::Event::kNoteExpressionValueEvent:
+                    DBG (hdr + " typeId=" + juce::String (e.noteExpressionValue.typeId)
+                             + " (" + noteExpressionTypeName (e.noteExpressionValue.typeId) + ")"
+                             + " noteId=" + juce::String (e.noteExpressionValue.noteId)
+                             + " value=" + juce::String (e.noteExpressionValue.value, 6));
+                    break;
+
+                case Steinberg::Vst::Event::kNoteExpressionIntValueEvent:
+                    DBG (hdr + " typeId=" + juce::String (e.noteExpressionIntValue.typeId)
+                             + " (" + noteExpressionTypeName (e.noteExpressionIntValue.typeId) + ")"
+                             + " noteId=" + juce::String (e.noteExpressionIntValue.noteId)
+                             + " value=" + juce::String ((int64) e.noteExpressionIntValue.value)
+                             + " (0x" + juce::String::toHexString ((int64) e.noteExpressionIntValue.value) + ")");
+                    break;
+
+                case Steinberg::Vst::Event::kNoteExpressionTextEvent:
+                    DBG (hdr + " typeId=" + juce::String (e.noteExpressionText.typeId)
+                             + " (" + noteExpressionTypeName (e.noteExpressionText.typeId) + ")"
+                             + " noteId=" + juce::String (e.noteExpressionText.noteId)
+                             + " textLen=" + juce::String (e.noteExpressionText.textLen)
+                             + " text=\"" + (e.noteExpressionText.text != nullptr
+                                             ? juce::String (juce::CharPointer_UTF16 ((juce::CharPointer_UTF16::CharType*) e.noteExpressionText.text))
+                                             : juce::String ("(null)")) + "\"");
+                    break;
+
+                case Steinberg::Vst::Event::kPolyPressureEvent:
+                    DBG (hdr + " ch=" + juce::String (e.polyPressure.channel)
+                             + " pitch=" + juce::String (e.polyPressure.pitch)
+                             + " pressure=" + juce::String (e.polyPressure.pressure, 4)
+                             + " noteId=" + juce::String (e.polyPressure.noteId));
+                    break;
+
+                case Steinberg::Vst::Event::kDataEvent:
+                {
+                    juce::String dataInfo = hdr
+                        + " size=" + juce::String (e.data.size)
+                        + " type=" + juce::String (e.data.type)
+                        + (e.data.type == Steinberg::Vst::DataEvent::kMidiSysEx ? " (SysEx)" : " (Unknown)");
+                    if (e.data.bytes != nullptr && e.data.size > 0)
+                    {
+                        juce::String hexDump = " bytes=[";
+                        for (uint32 b = 0; b < juce::jmin (e.data.size, (uint32) 16); ++b)
+                            hexDump += juce::String::toHexString (e.data.bytes[b]).paddedLeft ('0', 2) + " ";
+                        if (e.data.size > 16)
+                            hexDump += "...";
+                        hexDump += "]";
+                        dataInfo += hexDump;
+                    }
+                    DBG (dataInfo);
+                    break;
+                }
+
+                case Steinberg::Vst::Event::kChordEvent:
+                    DBG (hdr + " root=" + juce::String (e.chord.root)
+                             + " bass=" + juce::String (e.chord.bassNote)
+                             + " mask=0x" + juce::String::toHexString (e.chord.mask)
+                             + " text=\"" + (e.chord.text != nullptr
+                                             ? juce::String (juce::CharPointer_UTF16 ((juce::CharPointer_UTF16::CharType*) e.chord.text))
+                                             : juce::String ("(null)")) + "\"");
+                    break;
+
+                case Steinberg::Vst::Event::kScaleEvent:
+                    DBG (hdr + " root=" + juce::String (e.scale.root)
+                             + " mask=0x" + juce::String::toHexString (e.scale.mask)
+                             + " text=\"" + (e.scale.text != nullptr
+                                             ? juce::String (juce::CharPointer_UTF16 ((juce::CharPointer_UTF16::CharType*) e.scale.text))
+                                             : juce::String ("(null)")) + "\"");
+                    break;
+
+                case Steinberg::Vst::Event::kLegacyMIDICCOutEvent:
+                    DBG (hdr + " ch=" + juce::String (e.midiCCOut.channel)
+                             + " cc=" + juce::String (e.midiCCOut.controlNumber)
+                             + " val=" + juce::String (e.midiCCOut.value)
+                             + " val2=" + juce::String (e.midiCCOut.value2));
+                    break;
+
+                default:
+                    DBG (hdr + " (UNRECOGNIZED EVENT TYPE)");
+                    break;
+            }
+        }
+    }
+};
+#endif // JUCE_DEBUG_VST3_EVENTS
 
 //==============================================================================
 /*  Provides very quick polling of all parameter states.

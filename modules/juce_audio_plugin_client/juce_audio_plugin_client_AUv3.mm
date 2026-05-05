@@ -563,6 +563,11 @@ public:
         midiMessages.ensureSize (2048);
         midiMessages.clear();
 
+       #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+        umpMessages.ensureSize (2048);
+        umpMessages.clear();
+       #endif
+
         hostMusicalContextCallback = [au musicalContextBlock];
         hostTransportStateCallback = [au transportStateBlock];
 
@@ -1478,8 +1483,15 @@ private:
     }
 
     //==============================================================================
-    void processEvents (const AURenderEvent *__nullable realtimeEventListHead, [[maybe_unused]] int numParams, AUEventSampleTime startTime)
+    void processEvents (const AURenderEvent *__nullable realtimeEventListHead,
+                        [[maybe_unused]] int numParams,
+                        AUEventSampleTime startTime,
+                        [[maybe_unused]] bool& useUmpOut)
     {
+       #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+        const bool processorSupportsUMP = getAudioProcessor().supportsUMPProcessing();
+       #endif
+
         for (const AURenderEvent* event = realtimeEventListHead; event != nullptr; event = event->head.next)
         {
             switch (event->head.eventType)
@@ -1500,13 +1512,33 @@ private:
 
                     for (uint32_t i = 0; i < list.numPackets; ++i)
                     {
-                        converter.dispatch ({ reinterpret_cast<const uint32_t*> (packet->words),
-                                              (size_t) packet->wordCount },
-                                            static_cast<int> (packet->timeStamp - (MIDITimeStamp) startTime),
-                                            [this] (const ump::BytesOnGroup& x, double t)
-                                            {
-                                                midiMessages.addEvent ({ x.bytes.data(), (int) x.bytes.size(), t }, (int) t);
-                                            });
+                        const auto samplePos = static_cast<int> (packet->timeStamp - (MIDITimeStamp) startTime);
+
+                        if (processorSupportsUMP)
+                        {
+                            useUmpOut = true;
+                            umpDispatcher.dispatch ({ reinterpret_cast<const uint32_t*> (packet->words),
+                                                      (size_t) packet->wordCount },
+                                                    static_cast<double> (samplePos),
+                                                    [this] (const ump::View& v, double t)
+                                                    {
+                                                        umpMessages.addPacket (v, (int) t);
+                                                    });
+                        }
+                        else
+                        {
+                            umpDispatcher.dispatch ({ reinterpret_cast<const uint32_t*> (packet->words),
+                                                      (size_t) packet->wordCount },
+                                                    static_cast<double> (samplePos),
+                                                    [this] (const ump::View& v, double t)
+                                                    {
+                                                        toBytestreamConverter.convert (v, t,
+                                                                                       [this] (const ump::BytesOnGroup& x, double tt)
+                                                                                       {
+                                                                                           midiMessages.addEvent ({ x.bytes.data(), (int) x.bytes.size(), tt }, (int) tt);
+                                                                                       });
+                                                    });
+                        }
 
                         packet = MIDIEventPacketNext (packet);
                     }
@@ -1543,9 +1575,14 @@ private:
         {
             // process params and incoming midi (only once for a given timestamp)
             midiMessages.clear();
+           #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+            umpMessages.clear();
+           #endif
+
+            bool useUMP = false;
 
             const int numParams = juceParameters.getNumParameters();
-            processEvents (realtimeEventListHead, numParams, static_cast<AUEventSampleTime> (timestamp->mSampleTime));
+            processEvents (realtimeEventListHead, numParams, static_cast<AUEventSampleTime> (timestamp->mSampleTime), useUMP);
 
             lastTimeStamp = *timestamp;
 
@@ -1632,7 +1669,12 @@ private:
             }
 
             // process audio
-            processBlock (audioBuffer.getBuffer (frameCount), midiMessages);
+           #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+            if (useUMP)
+                processBlock (audioBuffer.getBuffer (frameCount), umpMessages);
+            else
+           #endif
+                processBlock (audioBuffer.getBuffer (frameCount), midiMessages);
 
             sendMidi ((int64_t) (timestamp->mSampleTime + 0.5), frameCount);
         }
@@ -1687,6 +1729,21 @@ private:
         else
             processor.processBlock (buffer, midiBuffer);
     }
+
+   #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
+    void processBlock (juce::AudioBuffer<float>& buffer, UMPBuffer& umpBuffer) noexcept
+    {
+        auto& processor = getAudioProcessor();
+        const ScopedLock sl (processor.getCallbackLock());
+
+        if (processor.isSuspended())
+            buffer.clear();
+        else if (bypassParam == nullptr && [au shouldBypassEffect])
+            processor.processBlockBypassed (buffer, umpBuffer);
+        else
+            processor.processBlock (buffer, umpBuffer);
+    }
+   #endif
 
     //==============================================================================
     void valueChangedFromHost (AUParameter* param, AUValue value)
@@ -1842,7 +1899,9 @@ private:
 
    #if JUCE_APPLE_MIDI_EVENT_LIST_SUPPORTED
     AudioUnitHelpers::EventListOutput eventListOutput;
-    ump::ToBytestreamDispatcher converter { 2048 };
+    ump::ToBytestreamConverter toBytestreamConverter { 2048 };
+    ump::Dispatcher umpDispatcher;
+    UMPBuffer umpMessages;
    #endif
 
     ObjCBlock<AUHostMusicalContextBlock> hostMusicalContextCallback;

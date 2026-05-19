@@ -120,21 +120,33 @@ private:
 
     bool messageReceived (const Message::ProfileDetails& body) const
     {
+        const auto address = ChannelAddress{}.withGroup (output->getIncomingGroup())
+                                             .withChannel (output->getIncomingHeader().deviceID);
+        const ProfileAtAddress profileAtAddress { body.profile, address };
+
         if (body.target == std::byte{})
         {
-            const auto address = ChannelAddress{}.withGroup (output->getIncomingGroup())
-                                                 .withChannel (output->getIncomingHeader().deviceID);
-            const ProfileAtAddress profileAtAddress { body.profile, address };
+            // target == 0x00: generic active/supported channel reply.
             const auto state = host->getState (profileAtAddress);
             std::vector<std::byte> extraData;
             detail::Marshalling::Writer { extraData } (state.active, state.supported);
             detail::MessageTypeUtils::send (*output, Message::ProfileDetailsResponse { body.profile, body.target, extraData });
-        }
-        else
-        {
-            detail::MessageTypeUtils::sendNAK (*output, std::byte { 0x04 });
+            return true;
         }
 
+        // Non-zero target: response is profile-specific, so defer to the
+        // delegate. If the delegate returns nullopt (the default), fall
+        // through to the NAK.
+        if (auto payload = host->delegate.profileDetailsRequested (output->getIncomingHeader().source,
+                                                                   profileAtAddress,
+                                                                   body.target))
+        {
+            detail::MessageTypeUtils::send (*output,
+                                            Message::ProfileDetailsResponse { body.profile, body.target, std::move (*payload) });
+            return true;
+        }
+
+        detail::MessageTypeUtils::sendNAK (*output, std::byte { 0x04 });
         return true;
     }
 
